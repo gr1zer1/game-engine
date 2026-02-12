@@ -477,6 +477,8 @@ dependencies = [
 name = "game_engine"
 version = "0.1.0"
 dependencies = [
+ "bytemuck",
+ "glam",
  "pollster",
  "wgpu",
  "winit",
@@ -514,6 +516,12 @@ dependencies = [
  "log",
  "xml-rs",
 ]
+
+[[package]]
+name = "glam"
+version = "0.32.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "34627c5158214743a374170fed714833fdf4e4b0cbcc1ea98417866a4c5d4441"
 
 [[package]]
 name = "glow"
