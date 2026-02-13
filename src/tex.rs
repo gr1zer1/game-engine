@@ -23,7 +23,7 @@ fn vertex(pos: [i8; 3], tc: [i8; 2]) -> Vertex {
         _tex_coord: [tc[0] as f32, tc[1] as f32],
     }
 }
-
+//TODO: fix uv(reversed textures)
 fn create_vertices() -> (Vec<Vertex>, Vec<u16>) {
     let vertex_data = [
         // top (0, 0, 1)
