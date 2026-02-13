@@ -53,6 +53,11 @@ impl ApplicationHandler for App {
                 &state.queue,
             ));
         };
+
+        // Request initial redraw
+        if let Some(window) = &self.window {
+            window.request_redraw();
+        }
     }
 
     fn window_event(
