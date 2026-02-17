@@ -1,148 +1,233 @@
-use std::f32::consts;
-use std::mem::size_of;
+use std::{mem::size_of, path::Path};
+
+use crate::game_object::{GameObject2D, RenderLayer};
+use image::{DynamicImage, GenericImageView};
 use wgpu::util::DeviceExt;
-
-use std::mem;
-
-use image::GenericImageView;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct Vertex {
-    _pos: [f32; 4],
-    _tex_coord: [f32; 2],
+    pos: [f32; 4],
+    tex_coord: [f32; 2],
 }
 
-// SAFETY: Vertex is repr(C) with only Copy types
+// SAFETY: Vertex is repr(C) with only Copy types.
 unsafe impl bytemuck::Pod for Vertex {}
 unsafe impl bytemuck::Zeroable for Vertex {}
 
 fn vertex(pos: [i8; 3], tc: [i8; 2]) -> Vertex {
     Vertex {
-        _pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
-        _tex_coord: [tc[0] as f32, tc[1] as f32],
+        pos: [pos[0] as f32, pos[1] as f32, pos[2] as f32, 1.0],
+        tex_coord: [tc[0] as f32, tc[1] as f32],
     }
 }
-//TODO: fix uv(reversed textures)
-fn create_vertices() -> (Vec<Vertex>, Vec<u16>) {
+
+fn create_vertices() -> ([Vertex; 4], [u16; 6]) {
     let vertex_data = [
-        // top (0, 0, 1)
-        vertex([-1, -1, 1], [0, 0]),
-        vertex([1, -1, 1], [1, 0]),
-        vertex([1, 1, 1], [1, 1]),
-        vertex([-1, 1, 1], [0, 1]),
-        // bottom (0, 0, -1)
-        vertex([-1, 1, -1], [1, 0]),
-        vertex([1, 1, -1], [0, 0]),
-        vertex([1, -1, -1], [0, 1]),
-        vertex([-1, -1, -1], [1, 1]),
-        // right (1, 0, 0)
-        vertex([1, -1, -1], [0, 0]),
-        vertex([1, 1, -1], [0, 1]),
-        vertex([1, 1, 1], [1, 1]),
-        vertex([1, -1, 1], [1, 0]),
-        // left (-1, 0, 0)
-        vertex([-1, -1, 1], [0, 0]),
-        vertex([-1, 1, 1], [0, 1]),
-        vertex([-1, 1, -1], [1, 1]),
-        vertex([-1, -1, -1], [1, 0]),
-        // front (0, 1, 0)
-        vertex([1, 1, -1], [1, 0]),
-        vertex([-1, 1, -1], [0, 0]),
-        vertex([-1, 1, 1], [0, 1]),
-        vertex([1, 1, 1], [1, 1]),
-        // back (0, -1, 0)
-        vertex([1, -1, 1], [0, 0]),
-        vertex([-1, -1, 1], [1, 0]),
-        vertex([-1, -1, -1], [1, 1]),
-        vertex([1, -1, -1], [0, 1]),
+        vertex([1, 1, 0], [1, 0]),
+        vertex([-1, 1, 0], [0, 0]),
+        vertex([-1, -1, 0], [0, 1]),
+        vertex([1, -1, 0], [1, 1]),
     ];
-
-    let index_data: &[u16] = &[
-        0, 1, 2, 2, 3, 0, // top
-        4, 5, 6, 6, 7, 4, // bottom
-        8, 9, 10, 10, 11, 8, // right
-        12, 13, 14, 14, 15, 12, // left
-        16, 17, 18, 18, 19, 16, // front
-        20, 21, 22, 22, 23, 20, // back
-    ];
-
-    (vertex_data.to_vec(), index_data.to_vec())
+    let index_data = [0, 1, 2, 2, 3, 0];
+    (vertex_data, index_data)
 }
 
-fn create_texels(size: usize) -> Vec<u8> {
-    (0..size * size)
-        .map(|id| {
-            // get high five for recognizing this ;)
-            let cx = 3.0 * (id % size) as f32 / (size - 1) as f32 - 2.0;
-            let cy = 2.0 * (id / size) as f32 / (size - 1) as f32 - 1.0;
-            let (mut x, mut y, mut count) = (cx, cy, 0);
-            while count < 0xFF && x * x + y * y < 4.0 {
-                let old_x = x;
-                x = x * x - y * y + cx;
-                y = 2.0 * old_x * y + cy;
-                count += 1;
-            }
-            count
-        })
-        .collect()
+struct RenderObject {
+    game_object: GameObject2D,
+    order: u64,
+    diffuse_bind_group: wgpu::BindGroup,
+    uniform_bind_group: wgpu::BindGroup,
+    uniform_buf: wgpu::Buffer,
 }
 
 pub struct Tex {
     vertex_buf: wgpu::Buffer,
     index_buf: wgpu::Buffer,
-    index_count: usize,
-    diffuse_bind_group: wgpu::BindGroup,
-    uniform_bind_group: wgpu::BindGroup,
-    #[allow(dead_code)]
-    uniform_buf: wgpu::Buffer,
+    index_count: u32,
+    texture_bind_group_layout: wgpu::BindGroupLayout,
+    uniform_bind_group_layout: wgpu::BindGroupLayout,
     pipeline: wgpu::RenderPipeline,
     pipeline_wire: Option<wgpu::RenderPipeline>,
+    view_proj: glam::Mat4,
+    objects: Vec<RenderObject>,
+    next_object_order: u64,
 }
 
 impl Tex {
-    fn desc() -> wgpu::VertexBufferLayout<'static> {
-        wgpu::VertexBufferLayout {
-            array_stride: mem::size_of::<Vertex>() as wgpu::BufferAddress,
-            step_mode: (wgpu::VertexStepMode::Vertex),
-            attributes: &[
-                wgpu::VertexAttribute {
-                    offset: 0,
-                    shader_location: 0,
-                    format: wgpu::VertexFormat::Float32x3,
-                },
-                wgpu::VertexAttribute {
-                    offset: mem::size_of::<[f32; 3]>() as wgpu::BufferAddress,
-                    shader_location: 1,
-                    format: wgpu::VertexFormat::Float32x2,
-                },
-            ],
-        }
-    }
-
-    fn generate_matrix(aspect_ratio: f32) -> glam::Mat4 {
-        let projection = glam::Mat4::perspective_rh(consts::FRAC_PI_4, aspect_ratio, 1.0, 10.0);
+    fn build_view_projection(aspect_ratio: f32) -> glam::Mat4 {
+        let projection = glam::Mat4::orthographic_rh(
+            -2.0 * aspect_ratio,
+            2.0 * aspect_ratio,
+            -2.0,
+            2.0,
+            0.1,
+            10.0,
+        );
         let view = glam::Mat4::look_at_rh(
-            glam::Vec3::new(1.5f32, -5.0, 3.0),
+            glam::Vec3::new(0.0, 0.0, 5.0),
             glam::Vec3::ZERO,
-            glam::Vec3::Z,
+            glam::Vec3::Y,
         );
         projection * view
     }
+
+    fn build_model_view_projection(view_proj: glam::Mat4, object: &GameObject2D) -> glam::Mat4 {
+        let model =
+            glam::Mat4::from_translation(glam::Vec3::new(
+                object.position.x,
+                object.position.y,
+                0.0,
+            )) * glam::Mat4::from_scale(glam::Vec3::new(object.scale.x, object.scale.y, 1.0));
+        view_proj * model
+    }
+
+    fn create_uniform_resources(
+        device: &wgpu::Device,
+        uniform_bind_group_layout: &wgpu::BindGroupLayout,
+        transform: glam::Mat4,
+    ) -> (wgpu::Buffer, wgpu::BindGroup) {
+        let matrix = transform.to_cols_array();
+        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("game_object_uniform"),
+            contents: bytemuck::bytes_of(&matrix),
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        });
+        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: uniform_bind_group_layout,
+            entries: &[wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform_buf.as_entire_binding(),
+            }],
+            label: Some("game_object_uniform_bind_group"),
+        });
+        (uniform_buf, uniform_bind_group)
+    }
+
+    fn create_diffuse_bind_group_from_image(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        texture_bind_group_layout: &wgpu::BindGroupLayout,
+        diffuse_image: DynamicImage,
+        label: &str,
+    ) -> wgpu::BindGroup {
+        let diffuse_rgba = diffuse_image.to_rgba8();
+        let dimensions = diffuse_image.dimensions();
+
+        let texture_size = wgpu::Extent3d {
+            width: dimensions.0,
+            height: dimensions.1,
+            depth_or_array_layers: 1,
+        };
+
+        let texture_label = format!("{label}_texture");
+        let diffuse_texture = device.create_texture(&wgpu::TextureDescriptor {
+            size: texture_size,
+            mip_level_count: 1,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format: wgpu::TextureFormat::Rgba8UnormSrgb,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            label: Some(texture_label.as_str()),
+            view_formats: &[],
+        });
+
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &diffuse_texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            &diffuse_rgba,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(4 * dimensions.0),
+                rows_per_image: Some(dimensions.1),
+            },
+            texture_size,
+        );
+
+        let diffuse_texture_view =
+            diffuse_texture.create_view(&wgpu::TextureViewDescriptor::default());
+        let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+            address_mode_u: wgpu::AddressMode::ClampToEdge,
+            address_mode_v: wgpu::AddressMode::ClampToEdge,
+            address_mode_w: wgpu::AddressMode::ClampToEdge,
+            mag_filter: wgpu::FilterMode::Linear,
+            min_filter: wgpu::FilterMode::Nearest,
+            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            ..Default::default()
+        });
+
+        let bind_group_label = format!("{label}_bind_group");
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            layout: texture_bind_group_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(&diffuse_texture_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::Sampler(&diffuse_sampler),
+                },
+            ],
+            label: Some(bind_group_label.as_str()),
+        })
+    }
+
+    fn sort_objects(&mut self) {
+        self.objects.sort_by_key(|object| {
+            let (layer_order, z_index) = object.game_object.render_sort_key();
+            (layer_order, z_index, object.order)
+        });
+    }
+
+    fn push_game_object_from_image(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        game_object: GameObject2D,
+        diffuse_image: DynamicImage,
+    ) {
+        let texture_label = if game_object.texture_path.is_empty() {
+            "scene_object".to_string()
+        } else {
+            game_object.texture_path.clone()
+        };
+
+        let diffuse_bind_group = Self::create_diffuse_bind_group_from_image(
+            device,
+            queue,
+            &self.texture_bind_group_layout,
+            diffuse_image,
+            texture_label.as_str(),
+        );
+
+        let transform = Self::build_model_view_projection(self.view_proj, &game_object);
+        let (uniform_buf, uniform_bind_group) =
+            Self::create_uniform_resources(device, &self.uniform_bind_group_layout, transform);
+
+        let object = RenderObject {
+            game_object,
+            order: self.next_object_order,
+            diffuse_bind_group,
+            uniform_bind_group,
+            uniform_buf,
+        };
+        self.next_object_order = self.next_object_order.saturating_add(1);
+
+        self.objects.push(object);
+        self.sort_objects();
+    }
+
     pub fn init(
         config: &wgpu::SurfaceConfiguration,
         _adapter: &wgpu::Adapter,
         device: &wgpu::Device,
-        queue: &wgpu::Queue,
+        _queue: &wgpu::Queue,
     ) -> Self {
-        let diffuse_bites = include_bytes!("happy_tree.png");
-        let diffuse_image = image::load_from_memory(diffuse_bites).unwrap();
-        let difuuse_rgba = diffuse_image.to_rgba8();
-
-        let dimensions = diffuse_image.dimensions();
-
-        // Create the vertex and index buffers
-        let vertex_size = size_of::<Vertex>();
         let (vertex_data, index_data) = create_vertices();
 
         let vertex_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
@@ -157,53 +242,6 @@ impl Tex {
             usage: wgpu::BufferUsages::INDEX,
         });
 
-        let texture_size = wgpu::Extent3d {
-            width: dimensions.0,
-            height: dimensions.1,
-            depth_or_array_layers: 1,
-        };
-
-        let diffuse_texture = device.create_texture(&wgpu::TextureDescriptor {
-            size: texture_size,
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: wgpu::TextureFormat::Rgba8UnormSrgb,
-            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
-            label: Some("diffuse_texture"),
-            view_formats: &[],
-        });
-
-        queue.write_texture(
-            wgpu::TexelCopyTextureInfo {
-                texture: &diffuse_texture,
-                mip_level: 0,
-                origin: wgpu::Origin3d::ZERO,
-                aspect: wgpu::TextureAspect::All,
-            },
-            &difuuse_rgba,
-            wgpu::TexelCopyBufferLayout {
-                offset: 0,
-                bytes_per_row: Some(4 * dimensions.0),
-                rows_per_image: Some(dimensions.1),
-            },
-            texture_size,
-        );
-
-        let diffuse_texture_view =
-            diffuse_texture.create_view(&wgpu::TextureViewDescriptor::default());
-
-        let diffuse_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-            address_mode_u: wgpu::AddressMode::ClampToEdge,
-            address_mode_w: wgpu::AddressMode::ClampToEdge,
-            address_mode_v: wgpu::AddressMode::ClampToEdge,
-            mag_filter: wgpu::FilterMode::Linear,
-            min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
-            ..Default::default()
-        });
-
-        // Create pipeline layout
         let texture_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[
@@ -220,8 +258,6 @@ impl Tex {
                     wgpu::BindGroupLayoutEntry {
                         binding: 1,
                         visibility: wgpu::ShaderStages::FRAGMENT,
-                        // This should match the filterable field of the
-                        // corresponding Texture entry above.
                         ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
                         count: None,
                     },
@@ -229,22 +265,6 @@ impl Tex {
                 label: Some("texture_bind_group_layout"),
             });
 
-        let diffuse_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &texture_bind_group_layout,
-            entries: &[
-                wgpu::BindGroupEntry {
-                    binding: 0,
-                    resource: wgpu::BindingResource::TextureView(&diffuse_texture_view),
-                },
-                wgpu::BindGroupEntry {
-                    binding: 1,
-                    resource: wgpu::BindingResource::Sampler(&diffuse_sampler),
-                },
-            ],
-            label: Some("diffuse_bind_group"),
-        });
-
-        // Create uniform bind group layout
         let uniform_bind_group_layout =
             device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
                 entries: &[wgpu::BindGroupLayoutEntry {
@@ -266,33 +286,9 @@ impl Tex {
             immediate_size: 0,
         });
 
-        // Create the texture
-
-        // Create other resources
-        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
-        let mx_ref: &[f32; 16] = mx_total.as_ref();
-        let uniform_buf = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Uniform Buffer"),
-            contents: bytemuck::cast_slice(mx_ref),
-            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-        });
-
-        // Create uniform bind group
-        let uniform_bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
-            layout: &uniform_bind_group_layout,
-            entries: &[wgpu::BindGroupEntry {
-                binding: 0,
-                resource: uniform_buf.as_entire_binding(),
-            }],
-            label: Some("uniform_bind_group"),
-        });
-
-        // Create bind group
-
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
-
         let vertex_buffers = [wgpu::VertexBufferLayout {
-            array_stride: vertex_size as wgpu::BufferAddress,
+            array_stride: size_of::<Vertex>() as wgpu::BufferAddress,
             step_mode: wgpu::VertexStepMode::Vertex,
             attributes: &[
                 wgpu::VertexAttribute {
@@ -309,7 +305,7 @@ impl Tex {
         }];
 
         let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-            label: None,
+            label: Some("main_pipeline"),
             layout: Some(&pipeline_layout),
             vertex: wgpu::VertexState {
                 module: &shader,
@@ -324,7 +320,7 @@ impl Tex {
                 targets: &[Some(config.format.into())],
             }),
             primitive: wgpu::PrimitiveState {
-                cull_mode: Some(wgpu::Face::Back),
+                cull_mode: None,
                 ..Default::default()
             },
             depth_stencil: None,
@@ -337,77 +333,124 @@ impl Tex {
             .features()
             .contains(wgpu::Features::POLYGON_MODE_LINE)
         {
-            let pipeline_wire = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
-                label: None,
-                layout: Some(&pipeline_layout),
-                vertex: wgpu::VertexState {
-                    module: &shader,
-                    entry_point: Some("vs_main"),
-                    compilation_options: Default::default(),
-                    buffers: &vertex_buffers,
-                },
-                fragment: Some(wgpu::FragmentState {
-                    module: &shader,
-                    entry_point: Some("fs_wire"),
-                    compilation_options: Default::default(),
-                    targets: &[Some(wgpu::ColorTargetState {
-                        format: config.format,
-                        blend: Some(wgpu::BlendState {
-                            color: wgpu::BlendComponent {
-                                operation: wgpu::BlendOperation::Add,
-                                src_factor: wgpu::BlendFactor::SrcAlpha,
-                                dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
-                            },
-                            alpha: wgpu::BlendComponent::REPLACE,
-                        }),
-                        write_mask: wgpu::ColorWrites::ALL,
-                    })],
+            Some(
+                device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+                    label: Some("wire_pipeline"),
+                    layout: Some(&pipeline_layout),
+                    vertex: wgpu::VertexState {
+                        module: &shader,
+                        entry_point: Some("vs_main"),
+                        compilation_options: Default::default(),
+                        buffers: &vertex_buffers,
+                    },
+                    fragment: Some(wgpu::FragmentState {
+                        module: &shader,
+                        entry_point: Some("fs_wire"),
+                        compilation_options: Default::default(),
+                        targets: &[Some(wgpu::ColorTargetState {
+                            format: config.format,
+                            blend: Some(wgpu::BlendState {
+                                color: wgpu::BlendComponent {
+                                    operation: wgpu::BlendOperation::Add,
+                                    src_factor: wgpu::BlendFactor::SrcAlpha,
+                                    dst_factor: wgpu::BlendFactor::OneMinusSrcAlpha,
+                                },
+                                alpha: wgpu::BlendComponent::REPLACE,
+                            }),
+                            write_mask: wgpu::ColorWrites::ALL,
+                        })],
+                    }),
+                    primitive: wgpu::PrimitiveState {
+                        front_face: wgpu::FrontFace::Ccw,
+                        cull_mode: None,
+                        polygon_mode: wgpu::PolygonMode::Line,
+                        ..Default::default()
+                    },
+                    depth_stencil: None,
+                    multisample: wgpu::MultisampleState::default(),
+                    multiview_mask: None,
+                    cache: None,
                 }),
-                primitive: wgpu::PrimitiveState {
-                    front_face: wgpu::FrontFace::Ccw,
-                    cull_mode: Some(wgpu::Face::Back),
-                    polygon_mode: wgpu::PolygonMode::Line,
-                    ..Default::default()
-                },
-                depth_stencil: None,
-                multisample: wgpu::MultisampleState::default(),
-                multiview_mask: None,
-                cache: None,
-            });
-            Some(pipeline_wire)
+            )
         } else {
             None
         };
 
-        println!("done!");
-        Self {
+        let tex = Self {
             vertex_buf,
             index_buf,
-            index_count: index_data.len(),
-            diffuse_bind_group,
-            uniform_bind_group,
-            uniform_buf,
+            index_count: index_data.len() as u32,
+            texture_bind_group_layout,
+            uniform_bind_group_layout,
             pipeline,
             pipeline_wire,
-        }
+            view_proj: Self::build_view_projection(config.width as f32 / config.height as f32),
+            objects: Vec::new(),
+            next_object_order: 0,
+        };
+
+        println!("done!");
+        tex
     }
+
     #[allow(dead_code)]
+    pub fn create_game_object(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: [f32; 2],
+        scale: [f32; 2],
+        texture: &str,
+    ) -> Result<(), String> {
+        self.create_game_object_layered(
+            device,
+            queue,
+            pos,
+            scale,
+            texture,
+            RenderLayer::Character,
+            0,
+        )
+    }
+
+    pub fn create_game_object_layered(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        pos: [f32; 2],
+        scale: [f32; 2],
+        texture: &str,
+        layer: RenderLayer,
+        z_index: i32,
+    ) -> Result<(), String> {
+        let diffuse_image = image::open(Path::new(texture))
+            .map_err(|err| format!("failed to load texture '{texture}': {err}"))?;
+        let object = GameObject2D::new(pos, scale, texture, layer, z_index);
+        self.push_game_object_from_image(device, queue, object, diffuse_image);
+        Ok(())
+    }
+
     pub fn resize(
         &mut self,
         config: &wgpu::SurfaceConfiguration,
         _device: &wgpu::Device,
         queue: &wgpu::Queue,
     ) {
-        let mx_total = Self::generate_matrix(config.width as f32 / config.height as f32);
-        let mx_ref: &[f32; 16] = mx_total.as_ref();
-        queue.write_buffer(&self.uniform_buf, 0, bytemuck::cast_slice(mx_ref));
+        self.view_proj = Self::build_view_projection(config.width as f32 / config.height as f32);
+
+        for object in &self.objects {
+            let matrix = Self::build_model_view_projection(self.view_proj, &object.game_object)
+                .to_cols_array();
+            queue.write_buffer(&object.uniform_buf, 0, bytemuck::bytes_of(&matrix));
+        }
     }
+
     pub fn render(&mut self, view: &wgpu::TextureView, device: &wgpu::Device, queue: &wgpu::Queue) {
         let mut encoder =
             device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         {
             let mut rpass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
-                label: None,
+                label: Some("main_pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view,
                     depth_slice: None,
@@ -427,18 +470,26 @@ impl Tex {
                 occlusion_query_set: None,
                 multiview_mask: None,
             });
-            rpass.push_debug_group("Prepare data for draw.");
-            rpass.set_pipeline(&self.pipeline);
-            rpass.set_bind_group(0, &self.diffuse_bind_group, &[]);
-            rpass.set_bind_group(1, &self.uniform_bind_group, &[]);
+
             rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
             rpass.set_vertex_buffer(0, self.vertex_buf.slice(..));
-            rpass.pop_debug_group();
-            rpass.insert_debug_marker("Draw!");
-            rpass.draw_indexed(0..self.index_count as u32, 0, 0..1);
-            if let Some(ref pipe) = self.pipeline_wire {
-                rpass.set_pipeline(pipe);
-                rpass.draw_indexed(0..self.index_count as u32, 0, 0..1);
+
+            for object in &self.objects {
+                if object.game_object.hidden {
+                    continue;
+                }
+
+                rpass.set_pipeline(&self.pipeline);
+                rpass.set_bind_group(0, &object.diffuse_bind_group, &[]);
+                rpass.set_bind_group(1, &object.uniform_bind_group, &[]);
+                rpass.draw_indexed(0..self.index_count, 0, 0..1);
+
+                if let Some(ref pipe) = self.pipeline_wire {
+                    rpass.set_pipeline(pipe);
+                    rpass.set_bind_group(0, &object.diffuse_bind_group, &[]);
+                    rpass.set_bind_group(1, &object.uniform_bind_group, &[]);
+                    rpass.draw_indexed(0..self.index_count, 0, 0..1);
+                }
             }
         }
 

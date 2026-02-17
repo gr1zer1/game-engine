@@ -8,6 +8,8 @@ use winit::{
 
 mod state;
 use state::State;
+mod game_object;
+mod scene_objects;
 mod tex;
 use tex::Tex;
 
@@ -46,13 +48,28 @@ impl ApplicationHandler for App {
         State::resumed(&mut self.state.as_mut().unwrap());
 
         if let Some(state) = &self.state {
-            self.tex = Some(Tex::init(
+            let mut tex = Tex::init(
                 &state.config.as_ref().unwrap(),
                 &state.adapter,
                 &state.device,
                 &state.queue,
-            ));
-        };
+            );
+
+            for object in scene_objects::read_initial_scene_objects() {
+                tex.create_game_object_layered(
+                    &state.device,
+                    &state.queue,
+                    object.position.to_array(),
+                    object.scale.to_array(),
+                    &object.texture_path,
+                    object.layer,
+                    object.z_index,
+                )
+                .expect("failed to create scene object");
+            }
+
+            self.tex = Some(tex);
+        }
 
         // Request initial redraw
         if let Some(window) = &self.window {
@@ -70,7 +87,7 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::RedrawRequested => {
-                if let Some(state) = self.state.as_ref() {
+                if let (Some(state), Some(tex)) = (self.state.as_ref(), self.tex.as_mut()) {
                     // Получаем текущий кадр из поверхности окна
                     let frame = state
                         .surface
@@ -82,10 +99,7 @@ impl ApplicationHandler for App {
                         .create_view(&wgpu::TextureViewDescriptor::default());
 
                     // Рендерим куб в этот кадр
-                    self.tex
-                        .as_mut()
-                        .unwrap()
-                        .render(&view, &state.device, &state.queue);
+                    tex.render(&view, &state.device, &state.queue);
 
                     // Показываем кадр на экране
                     frame.present();
@@ -134,9 +148,11 @@ impl ApplicationHandler for App {
                         config.width = new_size.width.max(1);
                         config.height = new_size.height.max(1);
                         state.surface.configure(&state.device, config);
+
+                        if let Some(tex) = self.tex.as_mut() {
+                            tex.resize(config, &state.device, &state.queue);
+                        }
                     }
-                }
-                if let Some(state) = &mut self.state {
                     state.redraw();
                 }
             }
