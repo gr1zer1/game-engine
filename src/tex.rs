@@ -1,4 +1,4 @@
-use std::{mem::size_of, path::Path};
+use std::{collections::HashMap, mem::size_of, path::Path};
 
 use crate::game_object::{GameObject2D, RenderLayer};
 use image::{DynamicImage, GenericImageView};
@@ -51,6 +51,7 @@ pub struct Tex {
     pipeline_wire: Option<wgpu::RenderPipeline>,
     view_proj: glam::Mat4,
     objects: Vec<RenderObject>,
+    object_lookup: HashMap<String, usize>,
     next_object_order: u64,
 }
 
@@ -156,7 +157,7 @@ impl Tex {
             address_mode_w: wgpu::AddressMode::ClampToEdge,
             mag_filter: wgpu::FilterMode::Linear,
             min_filter: wgpu::FilterMode::Nearest,
-            mipmap_filter: wgpu::MipmapFilterMode::Nearest,
+            mipmap_filter: wgpu::FilterMode::Nearest,
             ..Default::default()
         });
 
@@ -182,6 +183,15 @@ impl Tex {
             let (layer_order, z_index) = object.game_object.render_sort_key();
             (layer_order, z_index, object.order)
         });
+        self.rebuild_object_lookup();
+    }
+
+    fn rebuild_object_lookup(&mut self) {
+        self.object_lookup.clear();
+        for (index, object) in self.objects.iter().enumerate() {
+            self.object_lookup
+                .insert(object.game_object.scene_key(), index);
+        }
     }
 
     fn push_game_object_from_image(
@@ -283,7 +293,7 @@ impl Tex {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Render"),
             bind_group_layouts: &[&texture_bind_group_layout, &uniform_bind_group_layout],
-            immediate_size: 0,
+            push_constant_ranges: &[],
         });
 
         let shader = device.create_shader_module(wgpu::include_wgsl!("shader.wgsl"));
@@ -325,7 +335,7 @@ impl Tex {
             },
             depth_stencil: None,
             multisample: wgpu::MultisampleState::default(),
-            multiview_mask: None,
+            multiview: None,
             cache: None,
         });
 
@@ -368,7 +378,7 @@ impl Tex {
                     },
                     depth_stencil: None,
                     multisample: wgpu::MultisampleState::default(),
-                    multiview_mask: None,
+                    multiview: None,
                     cache: None,
                 }),
             )
@@ -386,6 +396,7 @@ impl Tex {
             pipeline_wire,
             view_proj: Self::build_view_projection(config.width as f32 / config.height as f32),
             objects: Vec::new(),
+            object_lookup: HashMap::new(),
             next_object_order: 0,
         };
 
@@ -423,10 +434,95 @@ impl Tex {
         layer: RenderLayer,
         z_index: i32,
     ) -> Result<(), String> {
-        let diffuse_image = image::open(Path::new(texture))
-            .map_err(|err| format!("failed to load texture '{texture}': {err}"))?;
-        let object = GameObject2D::new(pos, scale, texture, layer, z_index);
+        self.create_game_object_from_definition(
+            device,
+            queue,
+            GameObject2D::new(pos, scale, texture, layer, z_index),
+        )
+    }
+
+    pub fn create_game_object_from_definition(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        object: GameObject2D,
+    ) -> Result<(), String> {
+        let diffuse_image = image::open(Path::new(&object.texture_path)).map_err(|err| {
+            format!(
+                "failed to load texture '{}': {err}",
+                object.texture_path.as_str()
+            )
+        })?;
         self.push_game_object_from_image(device, queue, object, diffuse_image);
+        Ok(())
+    }
+
+    pub fn apply_game_object_from_definition(
+        &mut self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        object: GameObject2D,
+    ) -> Result<(), String> {
+        let object_key = object.scene_key();
+        if let Some(index) = self.object_lookup.get(&object_key).copied() {
+            self.update_existing_object(index, device, queue, object)?;
+            return Ok(());
+        }
+
+        self.create_game_object_from_definition(device, queue, object)
+    }
+
+    fn update_existing_object(
+        &mut self,
+        index: usize,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        object: GameObject2D,
+    ) -> Result<(), String> {
+        let new_matrix = Self::build_model_view_projection(self.view_proj, &object).to_cols_array();
+
+        let (order_changed, texture_changed, texture_path_for_reload) = {
+            let existing = self
+                .objects
+                .get_mut(index)
+                .ok_or_else(|| format!("invalid object index {index}"))?;
+
+            let order_changed = existing.game_object.render_sort_key() != object.render_sort_key();
+            let texture_changed = existing.game_object.texture_path != object.texture_path;
+            let texture_path_for_reload = if texture_changed {
+                Some(object.texture_path.clone())
+            } else {
+                None
+            };
+
+            existing.game_object = object;
+            queue.write_buffer(&existing.uniform_buf, 0, bytemuck::bytes_of(&new_matrix));
+
+            (order_changed, texture_changed, texture_path_for_reload)
+        };
+
+        if texture_changed {
+            let texture_path = texture_path_for_reload.expect("texture_changed checked above");
+            let diffuse_image = image::open(Path::new(&texture_path))
+                .map_err(|err| format!("failed to load texture '{texture_path}': {err}"))?;
+            let new_bind_group = Self::create_diffuse_bind_group_from_image(
+                device,
+                queue,
+                &self.texture_bind_group_layout,
+                diffuse_image,
+                texture_path.as_str(),
+            );
+            if let Some(existing) = self.objects.get_mut(index) {
+                existing.diffuse_bind_group = new_bind_group;
+            }
+        }
+
+        if order_changed {
+            self.sort_objects();
+        } else {
+            self.rebuild_object_lookup();
+        }
+
         Ok(())
     }
 
@@ -468,7 +564,6 @@ impl Tex {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
-                multiview_mask: None,
             });
 
             rpass.set_index_buffer(self.index_buf.slice(..), wgpu::IndexFormat::Uint16);
