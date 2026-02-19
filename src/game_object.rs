@@ -37,10 +37,10 @@ pub struct DialogueBoxObject {
 }
 
 impl DialogueBoxObject {
-    pub fn new(text: impl Into<String>) -> Self {
+    pub fn new(text: impl Into<String>, speaker: impl Into<String>) -> Self {
         Self {
             id: None,
-            speaker: "Lena".to_string(),
+            speaker: speaker.into(),
             text: text.into(),
             hidden: false,
         }

@@ -8,15 +8,18 @@ use winit::{
 
 mod state;
 use state::State;
+mod audio;
 mod dialogue_ui;
 mod game_object;
 mod input;
 mod scene_objects;
 mod scene_script;
+mod scripts;
 mod tex;
+use audio::AudioEngine;
 use dialogue_ui::DialogueUi;
 use input::{Action, ActionMap, InputState};
-use scene_script::SceneTimeline;
+use scene_script::{SceneRunner, ScriptContext, ScriptSignal};
 use tex::Tex;
 
 struct App {
@@ -24,7 +27,8 @@ struct App {
     state: Option<State>,
     tex: Option<Tex>,
     dialogue_ui: Option<DialogueUi>,
-    scene_timeline: Option<SceneTimeline>,
+    audio: Option<AudioEngine>,
+    scene_runner: Option<SceneRunner>,
     input: InputState,
     action_map: ActionMap,
     last_frame_time: Option<Instant>,
@@ -37,7 +41,8 @@ impl Default for App {
             state: None,
             tex: None,
             dialogue_ui: None,
-            scene_timeline: None,
+            audio: None,
+            scene_runner: None,
             input: InputState::default(),
             action_map: ActionMap::default(),
             last_frame_time: None,
@@ -75,15 +80,45 @@ impl ApplicationHandler for App {
                 &state.device,
                 state.config.as_ref().unwrap().format,
             );
+            let mut audio = match AudioEngine::new() {
+                Ok(audio) => Some(audio),
+                Err(err) => {
+                    eprintln!("audio disabled: {err}");
+                    None
+                }
+            };
+            if let Some(audio_engine) = audio.as_mut() {
+                // Built-in short blip used by dialogue typewriter.
+                audio_engine.register_tone("dialogue_typewriter", 1240, 18);
+                dialogue_ui.set_typewriter_sound("dialogue_typewriter", 0.16);
 
-            let mut scene_timeline = SceneTimeline::new(scene_objects::read_initial_scene_script());
-            scene_timeline
-                .update(0.0, &state.device, &state.queue, &mut tex, &mut dialogue_ui)
+                // Optional external override: place your own clip at assets/sfx/type_tick.wav.
+                if audio_engine
+                    .register_sound_file("dialogue_typewriter", "assets/sfx/type_tick.wav")
+                    .is_ok()
+                {
+                    dialogue_ui.set_typewriter_sound("dialogue_typewriter", 0.20);
+                }
+            }
+
+            let mut scene_runner =
+                SceneRunner::with_scripts(scene_objects::create_initial_scene_scripts());
+            let mut script_context = ScriptContext {
+                device: &state.device,
+                queue: &state.queue,
+                tex: &mut tex,
+                dialogue_ui: &mut dialogue_ui,
+                audio: audio.as_mut(),
+            };
+            // Run one bootstrap update so scripts can initialize scene state in start().
+            scene_runner
+                .update(0.0, &mut script_context)
                 .expect("failed to initialize scene script");
 
             self.tex = Some(tex);
             self.dialogue_ui = Some(dialogue_ui);
-            self.scene_timeline = Some(scene_timeline);
+            self.audio = audio;
+            self.scene_runner = Some(scene_runner);
             self.last_frame_time = Some(Instant::now());
         }
 
@@ -128,8 +163,9 @@ impl ApplicationHandler for App {
                     }
 
                     if self.action_map.just_pressed(Action::SkipWait, &self.input) {
-                        if let Some(scene_timeline) = self.scene_timeline.as_mut() {
-                            scene_timeline.skip_wait();
+                        if let Some(scene_runner) = self.scene_runner.as_mut() {
+                            // Broadcast to all scripts (used for dialogue skip/close behavior).
+                            scene_runner.send_signal(ScriptSignal::SkipWait);
                         }
                     }
 
@@ -140,13 +176,21 @@ impl ApplicationHandler for App {
                         .unwrap_or(0.0);
                     self.last_frame_time = Some(now);
 
-                    if let Some(scene_timeline) = self.scene_timeline.as_mut() {
-                        scene_timeline
-                            .update(dt, &state.device, &state.queue, tex, dialogue_ui)
+                    if let Some(scene_runner) = self.scene_runner.as_mut() {
+                        let mut script_context = ScriptContext {
+                            device: &state.device,
+                            queue: &state.queue,
+                            tex,
+                            dialogue_ui,
+                            audio: self.audio.as_mut(),
+                        };
+                        // Per-frame lifecycle update for all active scripts.
+                        scene_runner
+                            .update(dt, &mut script_context)
                             .expect("failed to update scene script");
                     }
 
-                    // Получаем текущий кадр из поверхности окна
+                    // Acquire the current frame from the window surface.
                     let frame = state
                         .surface
                         .get_current_texture()
@@ -156,18 +200,28 @@ impl ApplicationHandler for App {
                         .texture
                         .create_view(&wgpu::TextureViewDescriptor::default());
 
-                    // Рендерим сцену и диалоговый UI в этот кадр
+                    // Render the scene and dialogue UI into this frame.
                     tex.render(&view, &state.device, &state.queue);
-                    dialogue_ui.render(window.as_ref(), &state.device, &state.queue, &view);
+                    let audio = self.audio.as_mut();
+                    dialogue_ui.render(
+                        window.as_ref(),
+                        &state.device,
+                        &state.queue,
+                        &view,
+                        dt,
+                        audio,
+                    );
 
-                    // Показываем кадр на экране
+                    // Present the frame on screen.
                     frame.present();
 
-                    if self
-                        .scene_timeline
+                    let scripts_are_running = self
+                        .scene_runner
                         .as_ref()
-                        .is_some_and(|timeline| !timeline.is_finished())
-                    {
+                        .is_some_and(|runner| !runner.is_finished());
+                    let dialogue_is_animating = dialogue_ui.has_active_typewriter_animation();
+
+                    if scripts_are_running || dialogue_is_animating {
                         window.request_redraw();
                     }
 
