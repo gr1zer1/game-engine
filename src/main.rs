@@ -8,6 +8,7 @@ use winit::{
 
 mod state;
 use state::State;
+mod achievements;
 mod audio;
 mod dialogue_ui;
 mod game_object;
@@ -16,11 +17,18 @@ mod scene_objects;
 mod scene_script;
 mod scripts;
 mod tex;
+use achievements::AchievementManager;
 use audio::AudioEngine;
-use dialogue_ui::DialogueUi;
+use dialogue_ui::{DialogueUi, UiCommand};
 use input::{Action, ActionMap, InputState};
 use scene_script::{SceneRunner, ScriptContext, ScriptSignal};
 use tex::Tex;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AppMode {
+    MainMenu,
+    InGame,
+}
 
 struct App {
     window: Option<Arc<Window>>,
@@ -28,10 +36,13 @@ struct App {
     tex: Option<Tex>,
     dialogue_ui: Option<DialogueUi>,
     audio: Option<AudioEngine>,
+    achievements: Option<AchievementManager>,
     scene_runner: Option<SceneRunner>,
     input: InputState,
     action_map: ActionMap,
     last_frame_time: Option<Instant>,
+    mode: AppMode,
+    scene_bootstrapped: bool,
 }
 
 impl Default for App {
@@ -42,10 +53,13 @@ impl Default for App {
             tex: None,
             dialogue_ui: None,
             audio: None,
+            achievements: None,
             scene_runner: None,
             input: InputState::default(),
             action_map: ActionMap::default(),
             last_frame_time: None,
+            mode: AppMode::MainMenu,
+            scene_bootstrapped: false,
         }
     }
 }
@@ -69,7 +83,7 @@ impl ApplicationHandler for App {
         State::resumed(&mut self.state.as_mut().unwrap());
 
         if let Some(state) = &self.state {
-            let mut tex = Tex::init(
+            let tex = Tex::init(
                 &state.config.as_ref().unwrap(),
                 &state.adapter,
                 &state.device,
@@ -101,25 +115,38 @@ impl ApplicationHandler for App {
                 }
             }
 
-            let mut scene_runner =
+            let scene_runner =
                 SceneRunner::with_scripts(scene_objects::create_initial_scene_scripts());
-            let mut script_context = ScriptContext {
-                device: &state.device,
-                queue: &state.queue,
-                tex: &mut tex,
-                dialogue_ui: &mut dialogue_ui,
-                audio: audio.as_mut(),
-            };
-            // Run one bootstrap update so scripts can initialize scene state in start().
-            scene_runner
-                .update(0.0, &mut script_context)
-                .expect("failed to initialize scene script");
+            let achievements_path = scripts::achievements_catalog::DEFAULT_ACHIEVEMENTS_PATH;
+            if let Err(err) =
+                scripts::achievements_catalog::ensure_achievements_json_exists(achievements_path)
+            {
+                eprintln!("failed to prepare achievements catalog: {err}");
+            }
+            let achievements = AchievementManager::load_from_json_file(achievements_path)
+                .or_else(|err| {
+                    eprintln!("failed to load achievements json: {err}");
+                    AchievementManager::from_definitions(
+                        scripts::achievements_catalog::create_all_achievements(),
+                    )
+                })
+                .unwrap_or_else(|err| {
+                    eprintln!("failed to create fallback achievements catalog: {err}");
+                    AchievementManager::from_definitions(Vec::new())
+                        .expect("empty achievements catalog should be valid")
+                });
+
+            dialogue_ui.set_achievements_snapshot(achievements.snapshot());
+            dialogue_ui.set_main_menu_enabled(true);
 
             self.tex = Some(tex);
             self.dialogue_ui = Some(dialogue_ui);
             self.audio = audio;
+            self.achievements = Some(achievements);
             self.scene_runner = Some(scene_runner);
             self.last_frame_time = Some(Instant::now());
+            self.mode = AppMode::MainMenu;
+            self.scene_bootstrapped = false;
         }
 
         // Request initial redraw
@@ -151,44 +178,66 @@ impl ApplicationHandler for App {
             WindowEvent::CloseRequested => event_loop.exit(),
 
             WindowEvent::RedrawRequested => {
-                if let (Some(state), Some(tex), Some(dialogue_ui), Some(window)) = (
+                if let (
+                    Some(state),
+                    Some(tex),
+                    Some(dialogue_ui),
+                    Some(window),
+                    Some(achievements),
+                ) = (
                     self.state.as_ref(),
                     self.tex.as_mut(),
                     self.dialogue_ui.as_mut(),
                     self.window.as_ref(),
+                    self.achievements.as_mut(),
                 ) {
                     if self.action_map.just_pressed(Action::Exit, &self.input) {
                         event_loop.exit();
                         return;
                     }
 
-                    if self.action_map.just_pressed(Action::SkipWait, &self.input) {
+                    if matches!(self.mode, AppMode::InGame)
+                        && self.action_map.just_pressed(Action::SkipWait, &self.input)
+                        && dialogue_ui.can_skip_wait()
+                    {
                         if let Some(scene_runner) = self.scene_runner.as_mut() {
                             // Broadcast to all scripts (used for dialogue skip/close behavior).
                             scene_runner.send_signal(ScriptSignal::SkipWait);
                         }
                     }
 
-                    let now = Instant::now();
-                    let dt = self
-                        .last_frame_time
-                        .map(|last| (now - last).as_secs_f32())
-                        .unwrap_or(0.0);
-                    self.last_frame_time = Some(now);
+                    let dt = if matches!(self.mode, AppMode::InGame) {
+                        let now = Instant::now();
+                        let dt = self
+                            .last_frame_time
+                            .map(|last| (now - last).as_secs_f32())
+                            .unwrap_or(0.0);
+                        self.last_frame_time = Some(now);
+                        dt
+                    } else {
+                        0.0
+                    };
 
-                    if let Some(scene_runner) = self.scene_runner.as_mut() {
-                        let mut script_context = ScriptContext {
-                            device: &state.device,
-                            queue: &state.queue,
-                            tex,
-                            dialogue_ui,
-                            audio: self.audio.as_mut(),
-                        };
-                        // Per-frame lifecycle update for all active scripts.
-                        scene_runner
-                            .update(dt, &mut script_context)
-                            .expect("failed to update scene script");
+                    if matches!(self.mode, AppMode::InGame) {
+                        if let Some(scene_runner) = self.scene_runner.as_mut() {
+                            let mut script_context = ScriptContext {
+                                device: &state.device,
+                                queue: &state.queue,
+                                tex,
+                                dialogue_ui,
+                                achievements,
+                                audio: self.audio.as_mut(),
+                            };
+                            // Per-frame lifecycle update for all active scripts.
+                            scene_runner
+                                .update(dt, &mut script_context)
+                                .expect("failed to update scene script");
+                        }
                     }
+
+                    dialogue_ui.set_achievements_snapshot(achievements.snapshot());
+                    dialogue_ui
+                        .enqueue_achievement_notifications(achievements.take_notifications());
 
                     // Acquire the current frame from the window surface.
                     let frame = state
@@ -203,7 +252,7 @@ impl ApplicationHandler for App {
                     // Render the scene and dialogue UI into this frame.
                     tex.render(&view, &state.device, &state.queue);
                     let audio = self.audio.as_mut();
-                    dialogue_ui.render(
+                    let ui_command = dialogue_ui.render(
                         window.as_ref(),
                         &state.device,
                         &state.queue,
@@ -215,13 +264,62 @@ impl ApplicationHandler for App {
                     // Present the frame on screen.
                     frame.present();
 
-                    let scripts_are_running = self
-                        .scene_runner
-                        .as_ref()
-                        .is_some_and(|runner| !runner.is_finished());
-                    let dialogue_is_animating = dialogue_ui.has_active_typewriter_animation();
+                    match ui_command {
+                        UiCommand::None => {}
+                        UiCommand::StartGame => {
+                            if !self.scene_bootstrapped {
+                                if let Some(scene_runner) = self.scene_runner.as_mut() {
+                                    let mut script_context = ScriptContext {
+                                        device: &state.device,
+                                        queue: &state.queue,
+                                        tex,
+                                        dialogue_ui,
+                                        achievements,
+                                        audio: self.audio.as_mut(),
+                                    };
+                                    scene_runner
+                                        .update(0.0, &mut script_context)
+                                        .expect("failed to initialize scene script");
+                                }
+                                self.scene_bootstrapped = true;
+                            }
+                            self.mode = AppMode::InGame;
+                            dialogue_ui.set_main_menu_enabled(false);
+                            self.last_frame_time = Some(Instant::now());
+                            window.request_redraw();
+                        }
+                        UiCommand::SkipWait => {
+                            if matches!(self.mode, AppMode::InGame) && dialogue_ui.can_skip_wait() {
+                                if let Some(scene_runner) = self.scene_runner.as_mut() {
+                                    scene_runner.send_signal(ScriptSignal::SkipWait);
+                                }
+                                window.request_redraw();
+                            }
+                        }
+                        UiCommand::ExitApp => {
+                            event_loop.exit();
+                            return;
+                        }
+                    }
 
-                    if scripts_are_running || dialogue_is_animating {
+                    let achievements_path =
+                        scripts::achievements_catalog::DEFAULT_ACHIEVEMENTS_PATH;
+                    if let Err(err) = achievements.save_to_json_file(achievements_path) {
+                        eprintln!("failed to save achievements progress: {err}");
+                    }
+
+                    let has_achievement_popup = dialogue_ui.has_active_achievement_popup();
+                    if matches!(self.mode, AppMode::InGame) {
+                        let scripts_are_running = self
+                            .scene_runner
+                            .as_ref()
+                            .is_some_and(|runner| !runner.is_finished());
+                        let dialogue_is_animating = dialogue_ui.has_active_typewriter_animation();
+
+                        if scripts_are_running || dialogue_is_animating || has_achievement_popup {
+                            window.request_redraw();
+                        }
+                    } else if has_achievement_popup {
                         window.request_redraw();
                     }
 

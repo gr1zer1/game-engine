@@ -1,0 +1,30 @@
+[
+  {
+    "id": "first_launch",
+    "name": "Первый запуск",
+    "description": "Запустить игру и перейти в игровой режим.",
+    "trigger": "game_started",
+    "unlocked": true
+  },
+  {
+    "id": "intro_closed",
+    "name": "Диалог завершён",
+    "description": "Закрыть стартовый диалог персонажа.",
+    "trigger": "intro_closed",
+    "unlocked": true
+  },
+  {
+    "id": "intro_skipped",
+    "name": "Быстрый читатель",
+    "description": "Закрыть стартовый диалог по сигналу SkipWait.",
+    "trigger": "intro_skipped",
+    "unlocked": true
+  },
+  {
+    "id": "script_reward",
+    "name": "Скриптовая награда",
+    "description": "Достижение выдано напрямую из скрипта.",
+    "trigger": null,
+    "unlocked": true
+  }
+]

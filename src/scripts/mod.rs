@@ -1,3 +1,5 @@
+pub mod achievements;
+pub mod achievements_catalog;
 pub mod blink_sprite;
 pub mod bob_sprite;
 pub mod game;

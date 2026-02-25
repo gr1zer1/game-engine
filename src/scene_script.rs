@@ -1,6 +1,9 @@
 use std::collections::VecDeque;
 
-use crate::{audio::AudioEngine, dialogue_ui::DialogueUi, game_object::SceneObject, tex::Tex};
+use crate::{
+    achievements::AchievementManager, audio::AudioEngine, dialogue_ui::DialogueUi,
+    game_object::SceneObject, tex::Tex,
+};
 
 // Signals are broadcast by the app (input/system events) to all active scripts.
 #[derive(Clone, Copy, Debug)]
@@ -14,6 +17,7 @@ pub struct ScriptContext<'a> {
     pub queue: &'a wgpu::Queue,
     pub tex: &'a mut Tex,
     pub dialogue_ui: &'a mut DialogueUi,
+    pub achievements: &'a mut AchievementManager,
     #[allow(dead_code)]
     pub audio: Option<&'a mut AudioEngine>,
 }

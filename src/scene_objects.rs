@@ -46,6 +46,12 @@ pub fn create_initial_scene_scripts() -> Vec<Box<dyn SceneScript>> {
         Box::new(TimelineScript::new(read_initial_scene_commands())),
         Box::new(BlinkSpriteScript::new(blinking_sprite(), 0.45)),
         Box::new(BobSpriteScript::new(bobbing_sprite(), 0.18, 2.8)),
-        Box::new(Game::new()),
+        Box::new(Game::new(GameObject2D::new(
+            [0.0, 0.0],
+            [1.0, 1.0],
+            "src/image.jpg",
+            RenderLayer::Character,
+            5,
+        ))),
     ]
 }
